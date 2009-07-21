@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+
+if ARGV.empty?
+  STDERR.puts "Usage: #{$0} [-i] <XML files...>"
+  exit 1
+end
+
+if ARGV.any? { |arg| arg == '-i' }
+  ARGV.delete '-i'
+  ARGV.each { |filename|
+    text = File.read(filename).gsub(/>\s*</, ">\n<")
+    File.open(filename, 'w') { |f| f.puts text }
+  }
+else
+  puts ARGF.read.gsub(/>\s*</, ">\n<")
+end
+

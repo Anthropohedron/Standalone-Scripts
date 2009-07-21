@@ -1,0 +1,274 @@
+#!/usr/bin/env ruby
+# vim: endofline binary
+
+# This requires the following gems:
+#
+#       hpricot
+#       fastercsv
+#       rubyzip
+#
+
+require 'rubygems'
+require 'hpricot'
+require 'fastercsv'
+require 'zip/zipfilesystem'
+require 'tempfile'
+require 'fileutils'
+
+Hpricot::ElementContent['office:forms'] = :EMPTY
+Hpricot::ElementContent['table:table-column'] = :EMPTY
+Hpricot::ElementContent['text:tab'] = :EMPTY
+Hpricot::ElementContent['text:p'] = :EMPTY
+
+module ODSXML
+end
+
+ODSXML::BASEDOCPREFIX = <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0" xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0" xmlns:dr3d="urn:oasis:names:tc:opendocument:xmlns:dr3d:1.0" xmlns:math="http://www.w3.org/1998/Math/MathML" xmlns:form="urn:oasis:names:tc:opendocument:xmlns:form:1.0" xmlns:script="urn:oasis:names:tc:opendocument:xmlns:script:1.0" xmlns:ooo="http://openoffice.org/2004/office" xmlns:ooow="http://openoffice.org/2004/writer" xmlns:oooc="http://openoffice.org/2004/calc" xmlns:dom="http://www.w3.org/2001/xml-events" xmlns:xforms="http://www.w3.org/2002/xforms" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:rpt="http://openoffice.org/2005/report" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" xmlns:rdfa="http://docs.oasis-open.org/opendocument/meta/rdfa#" xmlns:field="urn:openoffice:names:experimental:ooo-ms-interop:xmlns:field:1.0" office:version="1.2">
+	<office:scripts/>
+	<office:font-face-decls>
+		<style:font-face style:name="Arial" svg:font-family="Arial" style:font-family-generic="swiss" style:font-pitch="variable"/>
+		<style:font-face style:name="Arial Unicode MS" svg:font-family="&apos;Arial Unicode MS&apos;" style:font-family-generic="system" style:font-pitch="variable"/>
+		<style:font-face style:name="Tahoma" svg:font-family="Tahoma" style:font-family-generic="system" style:font-pitch="variable"/>
+	</office:font-face-decls>
+	<office:automatic-styles>
+		<style:style style:name="co1" style:family="table-column">
+			<style:table-column-properties fo:break-before="auto" style:column-width="0.8925in"/>
+		</style:style>
+		<style:style style:name="ro1" style:family="table-row">
+			<style:table-row-properties style:row-height="0.1681in" fo:break-before="auto" style:use-optimal-row-height="true"/>
+		</style:style>
+		<style:style style:name="ro2" style:family="table-row">
+			<style:table-row-properties style:row-height="0.3283in" fo:break-before="auto" style:use-optimal-row-height="true"/>
+		</style:style>
+		<style:style style:name="ta1" style:family="table" style:master-page-name="Default">
+			<style:table-properties table:display="true" style:writing-mode="lr-tb"/>
+		</style:style>
+		<style:style style:name="ta_extref" style:family="table">
+			<style:table-properties table:display="false"/>
+		</style:style>
+	</office:automatic-styles>
+	<office:body>
+		<office:spreadsheet>
+EOF
+ODSXML::BASEDOCSUFFIX = <<'EOF'
+		</office:spreadsheet>
+	</office:body>
+</office:document-content>
+EOF
+#ODSXML::BASEDOC = ODSXML::BASEDOCPREFIX + ODSXML::BASEDOCSUFFIX
+
+module ODSXML
+  #def base_doc
+  #  Hpricot.XML(BASEDOC)
+  #end
+
+  def elem(tag, attrs={})
+    e = Hpricot::Elem.new(Hpricot::STag.new(tag))
+    attrs.each { |k,v|
+      e.set_attribute(k, v)
+    }
+    e
+  end
+
+  EntityReplacements = {
+    '&' => '&amp;',
+    '<' => '&lt;',
+    '>' => '&gt;',
+    '"' => '&quot;',
+    "'" => '&apos;'
+  }
+
+  def buildcell(value, type=nil)
+    type ||= 'string'
+    cell = elem('table:table-cell',
+                'office:value-type' => type)
+    text = elem('text:p')
+    cell.children.push text
+    if (value.empty? rescue true)
+      text = elem('text:p')
+      cell.children.push text
+      6.times { text.children.push elem('text:tab') }
+    else
+      value = value.gsub(/[#{EntityReplacements.keys.join}]/) { |m|
+        EntityReplacements[m]
+      }
+      text.children.push Hpricot::Text.new(value)
+    end
+    cell
+  end
+
+  def buildrow(fields, types=nil, style=nil)
+    style ||= fields.any? { |f| f.empty? rescue true } ? 'ro2' : 'ro1'
+    types ||= []
+    row = elem('table:table-row',
+               'table:style-name' => style)
+    row.children.push *fields.zip(types).map { |value,type|
+      buildcell(value, type)
+    }
+    fixup = make_fixup_list(row.children) { |e1,e2|
+			e1.to_plain_text == e2.to_plain_text
+		}
+		do_fixup(row.children, fixup) { |e,count|
+      e.set_attribute('table:number-columns-repeated', count.to_s)
+			e
+		}
+    row
+  end
+
+	ColumnStyleAttr = 'table:style-name'
+	ColumnCellStyleAttr = 'table:default-cell-style-name'
+
+  def buildcolumn(style=nil, cell_style=nil)
+    style ||= 'co1'
+    cell_style ||= 'Default'
+		elem('table:table-column',
+				 ColumnStyleAttr => style,
+				 ColumnCellStyleAttr => cell_style)
+  end
+
+  def make_fixup_list(elements)
+    fail "No block given" unless block_given?
+    latest = nil
+    fixup = []
+    elements.each_with_index { |e,i|
+      if latest && yield(e, latest.last)
+        if fixup.last && fixup.last.first == latest.first
+          fixup[-1][-1] += 1
+        else
+          fixup << [ latest.first, 2 ]
+        end
+      else
+        latest = [i, e]
+      end
+    }
+    fixup
+  end
+
+	def do_fixup(elements, fixup)
+    fixup.reverse.each do |index,count|
+			e = elements[index]
+			elements[index,count] = block_given? ? yield(e, count) : e
+		end
+		elements
+	end
+
+  # Known extra variable keys:
+  #   :style -- table style, defaults to 'Default'
+  #   :types -- parallel array to rows with cell types, defaults to []
+  #   :column_styles -- column styles, defaults to []
+  #   :row_styles -- row styles, defaults to []
+  def buildtable(name, rows, extra={})
+    extra = {
+      :style => 'ta1',
+      :types => [],
+      :column_styles => [],
+      :row_styles => []
+    }.merge!(extra)
+    table = elem('table:table',
+                 'table:name' => name,
+                 'table:style-name' => extra[:style],
+                 'table:print' => 'false')
+    first_row_style = extra[:row_styles].first || []
+    table.children << elem('office:forms',
+                           'form:automatic-focus' => 'false',
+                           'form:apply-design-mode' => 'false')
+    zipped = rows.first.zip(extra[:column_styles],
+                            first_row_style)
+    columns = zipped.map { |col,style,cell_style|
+      buildcolumn(style, cell_style)
+    }
+    fixup = make_fixup_list(columns) { |e1,e2|
+			(e1[ColumnStyleAttr] == e2[ColumnStyleAttr]) &&
+				(e1[ColumnCellStyleAttr] == e2[ColumnCellStyleAttr])
+    }
+		do_fixup(columns, fixup) { |e,count|
+			e.set_attribute('table:number-columns-repeated', count.to_s)
+			e
+		}
+    table.children.push *columns
+    zipped = rows.zip(extra[:row_styles], extra[:types])
+    table.children.push *zipped.map { |row,styles,types|
+      buildrow(row, types, styles)
+    }
+    table
+  end
+
+  def xml_postprocess(xml)
+    txt = xml.to_html
+    txt.gsub!(/\s+\/>/, '/>')
+    txt.gsub!(/\s{2,}/, ' ')
+    txt.gsub!(/>\s*</, ">\n<")
+    txt
+  end
+
+  def make_content_data_from_csv(*files)
+    dbranges = elem('table:database-ranges')
+    tables = files.map { |file|
+      csv = FasterCSV.read file
+      sheet = file.dup
+      sheet.sub!(/\.csv$/, '')
+      sheet.sub!(/_out$/, '')
+      lastcol = (2..csv.first.size).inject('A') { |col,waste| col.succ } + '1'
+      range = "#{sheet}.A1:#{sheet}.#{lastcol}"
+      dbranges.children << elem('table:database-range',
+                                'table:name' => sheet+'_headers',
+                                'table:target-range-address' => range,
+                                'table:display-filter-buttons' => "true")
+      xml_postprocess buildtable(sheet, csv)
+    }
+    tables.unshift BASEDOCPREFIX
+    tables << xml_postprocess(dbranges)
+    tables << BASEDOCSUFFIX
+    tables.join("\n")
+  end
+
+  extend self
+end
+
+if __FILE__ == $0
+  outputfile = nil
+  if ARGV.first == '-o'
+    ARGV.shift
+    outputfile = ARGV.shift
+  end
+  if ARGV.empty?
+    STDERR.puts "Usage: #{$0} [-o output.ods] <CSV files...>"
+    exit 1
+  end
+  content = ODSXML.make_content_data_from_csv(*ARGV)
+  out = Tempfile.new("combineCSV")
+  out.print DATA.read
+  out.flush
+  out.close
+  Zip::ZipFile.open(out.path) { |zip|
+    zip.file.open('content.xml', 'w') do |f|
+      f.puts content
+    end
+  }
+  if outputfile
+    FileUtils.cp(out.path, outputfile)
+  else
+    print File.read(out.path)
+  end
+  out.unlink
+end
+
+__END__
+PK    ¬¦ò:…l9Š.   .      mimetypeapplication/vnd.oasis.opendocument.spreadsheetPK    ¬¦ò:               Configurations2/statusbar/PK  ¬¦ò:            '   Configurations2/accelerator/current.xml PK           PK    ¬¦ò:               Configurations2/floater/PK    ¬¦ò:               Configurations2/popupmenu/PK    ¬¦ò:               Configurations2/progressbar/PK    ¬¦ò:               Configurations2/menubar/PK    ¬¦ò:               Configurations2/toolbar/PK    ¬¦ò:               Configurations2/images/Bitmaps/PK  ¬¦ò:            
+   styles.xmlİYmœ6şŞ_¸*J¤²ÀŞënn÷T©ªú¡WEIîøÀ°VŒl³/ùõì…öhÒ*M/R.ŒŸyñ3cÏ@îöõ¶XHÂÙÊg‘ïa–ğ”°|å?}ü=¸óÖ?İó,#	^¦<©
+ÌT Õbé2“ËzqåW‚-9’D.*°\ªdÉKÌ¬Ò²^WµÄ›ªnÀmm…÷jª²ÆvtÑótÏÜÖNÚMUÖXà´­ñ©Ê{IƒŒ	/J¤ÈI{JØ§•¿Qª\†án·›í.g\äa¼X,B³êN®¬5¨4	1ÅÚ™ãYZlšŸÆ¶CbUñŒÅdjB½¬–K€Àvu]N3ÔÖéÔ×6Ÿ\]Û|„ædƒÄä:3àn©\¦ÓKå2mëHmFò{>Â¢ùëñÏc]‰bª/íP•RNŞfnësÎ]¨Z¡>ì&Üy]…õs½;ß	¢°hÁ“³ğÑÄ1Î‹!Ò ‡€ğV—¼E½éQË×¡À%Ê’M¿ì€¹ó’fÈ¹¤œV4¾ÚB}ªB­rá{Í¥Ùº¨çşÚŞÊ‡9C	RœP¹¾¯O“{õ³såÿ*¢¾…n¡‡£¼­ªW‚3,/wDÊ¢$*ÒÜ"Ğ…ãâ‡\{OŒ@ÁŞã‡(^¡’Ë·§ÀZz>¸ƒT¸ø–è>¢/Ğ@Lná[½‡cùjäuSµQ¦8CmZ­µÜ„dZQ`J}?Š‚R@	E A[S	),Pp*WşüÈE‰Ê*7}-°Îy¤D*Ät‡f×„•u;íë™íuŠ-ãKŠX^¡d˜AÂ+¦ìåéƒªÀ©@l°`Ğ³¸Ïû½]jÌÚÆî›×7<ÅûÓÔ:³n}À°[3¦uVÒµ¾¯[`Ó	;9¬™ù+òO@^óT¦pz)É‰‚„ÅÆÑ€Mg#©„€Áí0ä*®ŞEv[N¡¹é©G‰
+ûÅ3§6šnŞ,¶•»õÏ.°#ûëãùÛÕ\ğª4c©	¼EHwïS)ñÇªØ'å0¿\dY?ÚWcSc×ól`k
+Tº"g)©G®-¢~ıæU®Ş®\ñ ²¤ŸA§¸Îd£Öìçà·úÀøãW[8®üËóº»ŞÜëJĞõ{&ıæ¦hŞJˆB”$ÖW,Åæjl1’S’@v$ÕãªA4Åfœšû.†&ù&¨…´u×¼ÀlMÎü«Øé«Gó^ºÏååŒô«ã?“˜3ÍP‰ÉY y%toÊˆ»«aZÃH“	G}¢¿Ğó€ò£Ñ•Ÿ€"L£­ÎU	ù¾ã›Rùc•ómÉl¿ŠR›)”
+^¿9p_éğQ?ÈğdRiuqÃ[
+I‚îSêfJÑWª³§Ç²ˆıP?(ı 
+ V>z>æd»;6Â,ãÒw’0};nš$D³ùâú–Ô³HDkgz¥+¾+}æJéŒh-î®ê™(ª	ç{D
+Ü`˜İÂ^.&äpş?Ë¡^{æ"ÕŸ.@xyuC˜gîvï"2?R¢´ş<˜è6¶Š(ù¤,Kí…~‘Dú#©…€öã^Éô6ücÔÔ—¶—k<½Áš…IgB&#Ô–Î4íS1pñÕá¯ïÍGÉ²ù-7×èõÃÃÃ}x*l$å		' si[8‘0'zM°æÆy§÷Ò<è°ëan[-Y/kªCúÙÂ/Qû¾ù s†ÙyY;äº­é€ş&ÙŞë§ˆ¢mHıü¦GDÇSGdÎÑ‰w®ğèœÓ›f‡9?ŠAtÄwş:ºã;ımjÑD¡ë_<0Dß,¯/—ó+ôPùtãûn5å…m y;Z/m`-û—j/>íáğ{¬¿ PKÊ¯’œ«  6  PK    ¬¦ò:"”<S  S     meta.xml<?xml version="1.0" encoding="UTF-8"?>
+<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:ooo="http://openoffice.org/2004/office" office:version="1.2"><office:meta><meta:initial-creator>G S</meta:initial-creator><meta:creation-date>2009-07-18T16:52:20</meta:creation-date><dc:date>2009-07-18T16:53:24</dc:date><dc:creator>G S</dc:creator><meta:editing-duration>PT00H01M08S</meta:editing-duration><meta:editing-cycles>1</meta:editing-cycles><meta:document-statistic meta:table-count="1" meta:cell-count="0" meta:object-count="0"/><meta:generator>OpenOffice.org/3.1$Unix OpenOffice.org_project/310m11$Build-9399</meta:generator></office:meta></office:document-meta>PK  ¬¦ò:               Thumbnails/thumbnail.pngëğsçå’âb``àõôp	Ò{8Ø€,N3A¦}.!sŞ^2ddPà9`Ğ÷s»MÌ‹.ıçŞÉ­˜qŸñÃ¤‡†6šmêG?,‘˜'rxrRE×¨à¨à€1^[Èö/êà‰2`‚fğtõsYç”Ğ PKÑÿA{   ÷  PK  ¬¦ò:               settings.xmlí™KsÚ0€ïıŒïÄ@m<¡“†6m3˜¤›°ĞDÖz$‡üúÊ6î×N/mN–ôízµÚ‡|öş>`­I‘÷­îAÇj÷Ğ§|Ñ·n¦íwÖûÁ›3œÏ©^ Wm	Jé)²¥—sédÃ}+ÜA"©t8	@:Ês0/s¶g;©°ìÉ=£ü®o-•
+Ûãø ><@±°»§§§v:šOõÏé¢®¨lö¶(Dü#(Y)“
+ëu:Gvößjm”Ü2MÏävÈ_p¶ı´©‚ ±Mkó8Q­oi‘ÎŠBüÇjVÙºÇkn©¤3CdŠ¡•ªu¨)WÖ sfÿyø
+æªòwê«eº×;~·7ıèbYªùQï¸.½°M¹÷à%A\¾Eéí\b]G_ˆÇ~AI©„Şkv_¤i-è9%ÚÏ)úx‰»Pİî7Š„Dq’*íı?zÉcòÏ2rmË<&_¢ ÈanÈ¨ú‚>Í¿D±‡ƒPÔ{–Ş3¢}n “çs[ÿ§ø;Úè)º‚”>!|aÖ<¹¾†cVTE”=¹fcwN=G¥00¸u¿ƒ©¦=/	ô–°¨HÍíìj²€$|>I?©€—<ÜéUÃiğ­{ Ò°\÷³ø»w€ğ26#¢:Í¾İcÏşGxî.1NœërãîZ@R¾ø3D„[ƒ9avó¦úË*JD{ğ¿¢j
+ıQĞb…c€œPGÈPĞ“#Ôíê*òÄÀ¾6`•K"µêQÀ'_ñu÷Ğˆ4èHÓ },¿EJw\à®ƒ2éB11ârNqB¤‚âF›8Yx,7mCc& õ~WÉİ#q_^)ï‰w£™OWTVªon²ÌË?¼§Ò]so)ÓØ!íXlšÆò	ºÅ¯)=ˆI6ø%·¯yãËW”ßİ„>QPİX¾¦¤×”ôš’şé”ôœ¤a¤pD˜1*Ìã¯u›ªßã«şSŞÁÚµúŒFÅ»‘prtN9ë:¨a²õñ(bşmGK"ˆ§ua
+‰[o~Çò3>””ğëˆ{*"%×nFzI²‚ÛìkÅ7>b(›ˆ0YºL!›qÂ!c:Ù&^ô	g#Â=`$\$şDgCälİ€ÆòÃæC”«¬:<!¢²º´ÿúeW}üPKš2Ä”  à  PK  ¬¦ò:               META-INF/manifest.xmlµ•AnÃ E÷9…ÅŞ¦Íª²âDj¥ =À$ˆ¢äöÅ‘’¸mT5•Ù…ßûŒ=°ÚS0v¶ÏÕ“(Ğ*×jÛ7âcû^¾ˆÍz±Àê‰ëË HïYºNƒ­¦ÚÂ€T³ªGÛ:´\]_¦õ¢¸;m°LÃ©¸É°ÕPòÉc#À{£pÊ)¶­Î®jª¨È„–öˆ,nÉæ–“Ç]4¦ôÀûFH!ŠrŸòæl§ûÎi)‰#í äÁƒRh0M]*†0 Õ8»+‹ 33Á½óÑ§$fÂ×¤|_zŒÎÎ™lp=@$_5à)«ãAö÷Ó„¢»§ŠºRSÁß2<(g<²{õ.<ùùÍü;—ødfÇÈ0ÛÁ³İÇagA’|VŞösÃç-,2§ëòZÚ•üq[®?PKATûCI  h  PK     ¬¦ò:…l9Š.   .                    mimetypePK     ¬¦ò:                         T   Configurations2/statusbar/PK   ¬¦ò:           '             Œ   Configurations2/accelerator/current.xmlPK     ¬¦ò:                         ã   Configurations2/floater/PK     ¬¦ò:                           Configurations2/popupmenu/PK     ¬¦ò:                         Q  Configurations2/progressbar/PK     ¬¦ò:                         ‹  Configurations2/menubar/PK     ¬¦ò:                         Á  Configurations2/toolbar/PK     ¬¦ò:                         ÷  Configurations2/images/Bitmaps/PK   ¬¦ò:Ê¯’œ«  6  
+             4  styles.xmlPK     ¬¦ò:"”<S  S                 meta.xmlPK   ¬¦ò:ÑÿA{   ÷                 Thumbnails/thumbnail.pngPK   ¬¦ò:š2Ä”  à               Q  settings.xmlPK   ¬¦ò:ATûCI  h                 META-INF/manifest.xmlPK      µ  «    
