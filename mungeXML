@@ -1,4 +1,9 @@
 #!/usr/bin/env ruby
+#
+# Very naive, very simple script to make XML files have one tag per line
+#
+# Run with no arguments for usage
+#
 
 if ARGV.empty?
   STDERR.puts "Usage: #{$0} [-i] <XML files...>"

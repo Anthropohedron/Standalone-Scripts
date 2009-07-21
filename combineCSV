@@ -1,7 +1,12 @@
 #!/usr/bin/env ruby
-# vim: endofline binary
+# vim: noendofline binary
 
-# This requires the following gems:
+# Create an OpenOffice.org spreadsheet file with one sheet per
+# input CSV file. Each CSV file is assumed to have column headers
+# in the first row, and those headers will be made autofilters in
+# the resulting spreadsheet. Run with no arguments for usage.
+#
+# The following gems are required:
 #
 #       hpricot
 #       fastercsv
